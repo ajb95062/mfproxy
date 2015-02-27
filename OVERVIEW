@@ -1,0 +1,389 @@
+
+MySQL proxy architecture overview and guide to the code.
+
+
+Purpose of this proxy
+=====================
+
+This proxy is an event-driven server that sits between one or more backend MySQL database servers
+and any number of frontend database clients.  Instead of connecting directly to the database, a client
+can connect to this proxy; the proxy will transparently forward database traffic between client and
+database.  The proxy establishes its own connections to the backend databases, independently of how
+many client connections are connected to the proxy.  Traffic is automatically multiplexed between the
+client and backend connections.
+
+The main advantage of this proxy is that it acts as a global database connection pool.  This insulates
+the backend MySQL database server from frequent connections and disconnections (which are relatively
+expensive in MySQL), and also allows the overall set of client connections to share a smaller number
+of backend database connections.  This can lead to much better efficiency if you have a large number
+of single-threaded database clients that spend most of their time with their database connections idle.
+
+Database connections are shared between clients at the SQL transaction level.  When a client wants
+to perform a database query, the proxy "leases" a database connection to the client for the duration
+of the transaction.  Once the transaction completes (or rolls back), the database connection is released
+back the pool for the next client to use.
+
+All I/O is event-driven and nonblocking (via libevent).  Because of this, large numbers of simultaneous
+connections can be supported efficiently in a single process.
+
+
+Compiling and running the proxy
+===============================
+
+The only real external dependency is libevent2; get it via "apt-get install libevent-dev"
+or build it from http://libevent.org/.  Any 2.x version should work.
+
+To build just run 'make'.
+
+To run the proxy once built, use the -c commandline option to specify one or more
+configuration files.  Configuration is described in the next section.  By default,
+the proxy ignores SIGHUP signals, so you can safely launch it in the background
+from a shell using "&" and then log out of your shell, without having to use 'nohup'.
+
+
+Configuration
+=============
+
+The config file has three main sections:
+
+  - "options", which specifies global options that apply to the proxy as a whole;
+
+  - "database_backends", where you can specify the MySQL databases that the proxy
+    should connect to, along with various options for each;
+
+  - "defaults", which are default options for database backend connection pools
+    that are used unless you explicitly override them.
+
+Please read through the "config/example.cfg" file; there are comments that describe
+what each option does.  A few of the options may need further explanation and these
+are described in the following sections here.
+
+
+Apparent database names
+=======================
+
+From a client's point of view, the proxy presents itself as a single MySQL server.
+When a client connects, it specifies which database it wants to use for the duration
+of the connection.  However, the proxy itself can connect to many separate database
+servers, and each of those servers may have a database of the same name.  If the client
+wants to use the database with this name, there is an ambiguity because there is no way
+to specify which database host is being referred to.
+
+To get around this, the proxy's database names are configured in terms of "apparent"
+and "actual" names.  Suppose you have a situation like this:
+
+  proxy -> MySQL Host #1 with database named "example"
+        -> MySQL Host #2 with database named "example"
+
+If a client connects to the proxy and requests to use the "example" database there is
+no way to decide whether to use Host #1 or #2.  To handle this, you can configure the
+proxy with something like this:
+
+database_backends = [
+  { hostname = "host1",
+    apparent_database_name = "example1"
+    actual_database_name = "example"
+  },
+
+  { hostname = "host2",
+    apparent_database_name = "example2"
+    actual_database_name = "example"
+  }
+]
+
+This tells the proxy that when connecting to the backend database servers, it should
+use the "example" database on the MySQL host itself, but it should present these
+as "example1" and "example2" to connecting clients.  Thus, clients should request
+either "example1" or "example2" as their database name and this will allow the proxy
+to select the proper backend and remove the ambiguity.
+
+This type of configuration is common in production database setups that use horizontal
+partitioning (sharding).  You may have many separate MySQL servers, each holding a fraction
+of the overall data, but with the database named the same on each server (e.g. "shard").
+This apparent_database_name facility allows you to handle this situation cleanly.
+
+
+Client authentication
+=====================
+
+Since the proxy connects to the MySQL servers itself, and all the MySQL authentication
+information (usernames/passwords) are contained in the proxy's config file, clients which
+connect to the proxy don't necessarily need to supply these credentials.  Whether or not
+to require credentials from clients is controlled by the "require_client_auth" configuration
+option.
+
+If this option is not set, usernames and passwords supplied by client connections to the proxy
+are completely ignored, and "authentication" automatically succeeds.  If you are running in a
+trusted environment this is normally the simplest option.
+
+If this option is set, connecting clients must supply the exact same username and password as
+those specified in the proxy's config file for the requested database.  The proxy itself implements
+the full MySQL connection handshake and the client authenticates the same as if it were connecting
+directly to MySQL.
+
+Note that a limitation of this proxy is that multiple usernames for a given backend database are
+not supported.  You can only specify one username/password combination per connection pool in the
+"database_backends" configuration section.
+
+
+Nonblocking DNS
+===============
+
+Normally, DNS lookups using the standard "getaddrinfo" OS call will block the calling process
+until the resolution succeeds or fails.  In a high-throughput production implementation this
+may be unacceptable since this will block all connected clients while the getaddrinfo call
+is in progress - which may take an arbitrarily long time if there are problems or bottlenecks
+in DNS itself.
+
+Fortunately, libevent provides a fully nonblocking implementation of DNS that plays well with
+event-driven systems.  To enable this, set the "use_nonblocking_dns" option to "true" in the
+config file.  Otherwise, blocking DNS lookups will be used.  Try changing this option if you
+are having trouble with DNS in the proxy.
+
+
+Statsd integration
+==================
+
+As the proxy runs, many different runtime statistics are collected internally.
+The available statistics will be documented here eventually but for now please
+refer to "stats.cxx" and "stats.h" to see what is available.
+
+The proxy has the ability to send these statistics at regular intervals to an
+external Statsd server: https://github.com/etsy/statsd/
+
+If you want to use this capability, set the following configuration options to
+appropriate values:
+
+  - statsd_hostname
+  - statsd_port
+  - statsd_key_prefix
+  - statsd_send_interval
+
+Note that currently only UDP is supported for talking to statsd.  This is the default
+for statsd but statsd can also be configured to use TCP.  TCP support could be added
+fairly easily to the proxy if there is a demand for it.
+
+
+Overall architecture
+====================
+
+This section describes overall design decisions and architecture of the proxy.
+
+This proxy is implemented as an event-driven server, similar to memcached or nginx.
+It runs in a single process and thread and handles all network I/O using libevent
+(http://libevent.org/).  Since the proxy does very little expensive computation on
+its own, it's I/O bound and an event-driven architecture is optimal for this case.
+
+The MySQL server itself is implemented using a more traditional threading model.
+Each client that connects to MySQL generates a new thread in the MySQL server to
+handle the connection.  This is normally fine, but leads to poor scalability with
+large numbers of connections.  Furthermore, a typical use case for databases is to
+have large numbers of connections that are each idle most of the time.  In this
+case, MySQL is able to handle parallel requests up to a point, because there will
+usually only be a relatively small number of queries in progress at any given time.
+However, if a larger proportion of connected clients suddenly decide to run queries
+at the same time, it can lead to a "snowball" effect in MySQL where (because of the
+threading model), all the simultaneous queries each slow down each other in a
+nonlinear way, leading to a cascade of timeouts and failed queries.
+
+This proxy aims to help with this scenario by:
+
+  - Absorbing large numbers of mostly-idle connection from clients in an efficient
+    way - because of the event-driven architecture, it is much faster to connect
+    to the proxy than to the database engine directly.
+
+  - Funnelling client queries through a (possibly) smaller number of database
+    connections to avoid the worst case "snowball" failure mode.  If the smaller
+    number of database connections is insufficient to handle all the traffic, the
+    queries simply block from the client's point of view.  The database engine
+    itself is never exposed to large numbers of parallel queries.
+    
+
+Guide to the source code
+========================
+
+The rest of this document is meant as a guide to the source code, for those who
+are trying to add or change features, or who are just curious about the implementation.
+
+For simplicity, the proxy is written in a limited subset of C++ with only minimal
+dependencies.  The only third-party library required is libevent; the actual MySQL
+development libraries and headers are not used.  STL is not used.  The only real
+features from C++ that are used are basic classes, inheritance and virtual functions;
+otherwise it's stylistically straight C.  This approach was taken to keep everything
+simple and transparent - since this proxy may be a critical architectural component
+in a larger stack it's important to keep the code as straightforward as possible,
+especially considering an event-driven architecture in a C-like language already
+imposes a lot of extra complexity.
+
+
+Class structure
+===============
+
+The central classes used in the code base are the following:
+
+Server: Top-level object that keeps track of everything going on in the proxy
+
+Config: The various configuration options and database configs read from the config file
+
+Connection: Abstract superclass for all network connections to/from the proxy.
+
+  ClientConnection: Network connections from clients connecting to this proxy.
+
+  DatabaseConnection: Network connections from the proxy to database backends.
+
+ConnectionPool: Encapsulates one or more DatabaseConnections; for a given
+                ConnectionPool, all the connections are to the same database server.
+
+PendingLeaseRequest: Represents an incoming client request that is waiting for a database
+                     connection to become available; this allows us to "block" a client connection
+                     until ready.
+
+Packet: A packet in the MySQL protocol.  The Packet class itself is abstract, and its subclasses
+        represent specific packet types.
+
+AllocationStats: Records memory allocation statistics, to help track down possible memory leaks.
+StatsCollector: Abstract superclass for runtime statistics that are gathered over a specific time interval.
+  ClientStatsCollector: Aggregates statistics about client connections and throughput.
+  PoolStatsCollector: Aggregates statistics about what is happening in a particular database connection pool.
+
+StatsdInterface: Manages a nonblocking transmission of runtime statistics via UDP datagrams
+                 to a statsd server (if configured)
+
+
+MySQL protocol implementation
+=============================
+
+Because the proxy needs to share backend database connections amongst client connections, it
+needs to interpret and understand the low-level MySQL protocol.  It does this by decoding the
+MySQL protocol at the packet level.  Most of the packet-related logic is contained in the
+packet.cxx and packet.h source files.
+
+In the future, this section will contain more details on the packet encoding and decoding.
+For now note that the proxy occasionally has to synthesize its own packets and insert them
+into the protocol stream (which is why the encoding is necessary).  Also, inspecting the
+packets as they go over the wire is critical to maintaining proper context as to where we
+are in the protocol, as the MySQL wire protocol is heavily context dependent.
+
+
+Transaction handling and database connection leases
+===================================================
+
+During periods where a client connection is idle (not in the middle of a transaction or waiting
+for query results), it is not associated with any particular backend database connection.  When
+a query request is received from a client, the proxy looks for an available database connection
+from the connection pool to handle the query.  Assuming it finds one, it temporarily associates
+that database connection with the client connection and forwards the query on to the database
+connection.
+
+Once the database connection executes the query and has finished sending result rows, it sends
+some additional flags indicating whether or not a transaction has been opened by the query.
+For example, if an explicit "BEGIN" SQL query is executed, this will leave a transaction open
+after the query runs.  However, a "COMMIT" or "ROLLBACK" query (or any normal query, if autocommit
+is enabled) will end an in-progress transaction.  The proxy inspects these flags and if a
+transaction is still open, it leaves the database connection associated with the client connection.
+This is done so that all the statements within a single transaction go through the same backend
+database connection, as required by the MySQL protocol.
+
+If the query result flags indicate that the connection is no longer in a transaction, the
+database connection is disassociated from the client and returned back to the connection pool.
+If other clients are waiting on a database connection to become available then the connection
+is immediately reused for one of the waiting clients.
+
+Note that MySQL "savepoints" receive no special handling.  The proxy treats these the same as
+any other SQL statement.
+
+This transaction handling logic is what allows the proxy to multiplex many client connections
+through a smaller number of database connections.  It also implies that successive queries
+from a given client may go through completely different backend database connections.  This
+should be no cause for worry, even taking into account possible race conditions from network
+propagation delays.  Since the MySQL protocol is a based on a query/response loop, rather than
+being completely asynchronous, successive queries will always be executed in order within the
+MySQL engine even if they occur in different connection threads within MySQL.
+
+
+Error handling
+==============
+
+In a typical production environment there are many error conditions that can occur.  These
+include network connectivity interruptions or slowness, buggy client code, crashes in the
+MySQL servers themselves, DNS lookup errors and so forth.  The proxy tries to handle as
+many anticipated error conditions as possible.  The following sections summarize the error
+handling facilities built in.
+
+- Automatic database reconnection: If a backend database connection is unexpectedly closed,
+  the proxy will attempt to automatically reconnect.
+
+- The maximum number of client connections can be controlled by the "max_client" config
+  option.  If this is exceeded the proxy will immediately send QUIT packets to excess
+  clients the same as the MySQL server itself does.
+
+- A client may unexpectedly send large amounts of data to the proxy while waiting on an
+  existing query to complete.  This may cause large amounts of data to be buffered in RAM.
+  To avoid running out of RAM this way in the proxy, the "max_client_input_backlog" may
+  be used to impose an upper bound on this.
+
+- A buggy or malicious client may "hog" connection leases by never closing their transaction,
+  executing a long-running query such as "select sleep(1000)", and so forth.  Timeouts can
+  be configured for these cases using the config options:
+    - max_idle_connection_lease_time: limits how long clients can hold connections leases while idle
+    - max_connection_lease_time: limits how long clients can hold connection leases no matter what
+    - database_query_timeout: limits how long the proxy waits for a query to complete
+    - pending_lease_request_timeout: limits how long we can block a client that is waiting on a connection lease
+
+- Timeouts to the database engine itself: the "database_connect_timeout" option can be used to limit
+  how long the proxy waits to establish a connection to a backend database.  A limit can be imposed on
+  the amount of time we keep any given database connection open via "max_database_connection_lifetime"
+  (this can be useful for a measure of self-healing; database connections that are held open for extremely
+  long amounts of time may eventually fall prey to random corruption from bugs or network glitches).
+
+- DNS lookup failures: The nonblocking DNS mechanism described earlier will prevent clients from blocking
+  because of slow/broken DNS, and DNS failures will be automatically retried.
+
+
+Clean shutdown
+==============
+
+The proxy implements a clean shutdown mechanism for when you want to do a controlled shutdown for whatever
+reason.  By default, a clean shutdown is initiated when SIGTERM or SIGINT is received by the proxy.
+Instead of abruptly closing all network connections and terminating (which may interrupt in-progress
+transactions), the proxy will enter a three-phase shutdown process:
+
+  - First, the proxy stops accepting new client connections and enters a state where it is waiting
+    for all currently in-flight transactions to complete normally.  In typical use this will happen
+    in under a second or so.
+
+  - Once in-flight transactions are finished, the proxy will close client network connections and send
+    QUIT packets to all the backend databases.  This is the best way to cleanly disconnect from the database
+    without suddenly closing the network socket.
+
+  - The backend databases should respond to the QUIT packets by closing the network connection from their
+    end.  Once all database connections from the proxy close in this way, the proxy process finally exits.
+
+
+Limitations of the proxy
+========================
+
+There are a few inherent limitations that arise when using this kind of proxy with MySQL.
+These could be addressed with some effort but would add extra complexity.
+
+  - Since the proxy assigns MySQL connection IDs to client connections, and client connections
+    are only transiently associated with backend database connections, the KILL <process_id> SQL
+    command will not behave as expected.  The mysql commandline client sends KILL commands when
+    an interrupt signal is received, so be careful about this.  To fix this, the proxy would need
+    to inspect for KILL commands and translate the process_ids itself.
+
+  - Prepared statements do not work.  Prepared statements exist, once prepared, as objects on the
+    MySQL server, and referred to by an integer ID.  In order to implement prepared statements
+    correctly, the proxy would need to intercept statement preparation requests from clients,
+    forward the requests on to all backend databases in the pool, assign a statement ID itself,
+    and then keep track of a map of proxy-assigned statement ID to database-assigned statement IDs.
+    In addition, if a database backend connection is closed and the proxy reconnects, the proxy
+    would need to recompile all prepared statements in the new database server.  There is also
+    the possibility that prepared statement compilation could succeed on one database connection
+    and not another (due to timeouts, for example) and this would need to be handled somehow.
+
+  - Since the proxy handles authentication itself, plugin auth methods are not supported.
+    Currently all that is supported is the mysql_native_password auth method.  If you are using
+    a different auth plugin in your production setup (for example, PAM or LDAP), you may not
+    be able to use this proxy without implementing support for your auth plugin yourself.
+    

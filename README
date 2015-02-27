@@ -1,0 +1,40 @@
+
+Lightweight MySQL connection multiplexing proxy.
+
+This was developed for internal use by MyFitnessPal (http://www.myfitnesspal.com)
+and is being open-sourced with their permission.
+
+Please see the file OVERVIEW for details about this program.
+
+
+
+Building:
+---------
+
+The only real external dependency is libevent2; get it via "apt-get install libevent-dev"
+or build it from http://libevent.org/.  Any 2.x version should work.
+
+To build just run 'make'.
+
+
+Running:
+--------
+
+You can specify one or more config options via -c commandline options.
+
+To keep things simple, the overall configuration options are in 'defaults.cfg'
+and the database backend configurations are in 'development.cfg', 'production.cfg', etc,
+depending on your environment.  So you would typically run the proxy like this:
+
+$ ./proxy example_configs/defaults.cfg example_configs/development.cfg
+
+
+
+STUFF YET NOT IMPLEMENTED
+=========================
+
+- Prepared statements (http://dev.mysql.com/doc/internals/en/prepared-statements.html)
+- Stored procedures with multi-resultsets (http://dev.mysql.com/doc/internals/en/stored-procedures.html)
+- SSL and compression support for connections
+- LOAD DATA INFILE - connect to the databases directly if you want to use this
+
